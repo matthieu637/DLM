@@ -598,14 +598,13 @@ class Model(nn.Module):
                 inp[1] = f[0]
                 inp[2] = f[1]
             if args.model == 'dlm':
-                path = None
                 if not self.training and args.extract_path:
+                    self.features.extract_graph(self.feature_axis, self.pred)
                     for i in range(len(inp)):
                         if inp[i] is None:
                             continue
                         inp[i] = inp[i].bool()
-                    path = self.pred.weight.argmax(-1)
-                features = self.features(inp, depth=depth, pathFrompred=path, feature_axis=self.feature_axis, extract_rule=args.extract_rule)
+                features = self.features(inp, depth=depth, extract_rule=args.extract_rule)
                 f = features[0][self.feature_axis]
                 more_info = features[1]
             else:
@@ -701,12 +700,12 @@ def run_episode(env,
         # by default network isn't in training mode during data collection
         # but with dlm we don't want to use argmax only
         # except in 2 cases (testing the interpretability or the last mining phase to get an interpretable policy):
-        if mode == 'test-inter' or (mode in ['mining', 'inherit'] and number == args.curriculum_graduate):
+        if ('inter' in mode) or (('mining' in mode) or ('inherit' in mode) and number == args.curriculum_graduate):
             model.lowernoise()
         else:
             model.train(True)
 
-            if args.dlm_noise == 1 and mode in ['mining', 'inherit', 'test', 'test-inter']:
+            if args.dlm_noise == 1 and (('mining' in mode) or ('inherit' in mode) or ('test' in mode)):
                 model.lowernoise()
             elif args.dlm_noise == 2:
                 model.lowernoise()
@@ -829,7 +828,7 @@ class MyTrainer(MiningTrainerBase):
         return player
 
     def _get_result_given_player(self, index, meters, number, player, mode):
-        assert mode in ['train', 'test', 'mining', 'inherit', 'test-inter', 'test-inter-deter', 'test-deter']
+        assert mode in ['train', 'test', 'mining', 'mining-deter', 'mining-stoch', 'inherit', 'test-inter', 'test-inter-deter', 'test-deter']
         params = dict(
             eval_only=True,
             number=number,

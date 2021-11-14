@@ -4,6 +4,11 @@
 If you want to use PPO with our proposed critic use learn-ppo.py.
 If you want to run REINFORCE without critic, use learn-reinforce.py.
 
+On Path and Blocksworld, finding an interpretable policy is much more difficult due to the needed depth.
+You can use learn-ppo-incr.py to learn a stack of DLMs in an incremental fashion.
+
+To evaluate how our incremental method can help, we also provide learn-imitation.py and learn-imitation-incr.py which tries to copy a working policy (with or without incremental learning).
+
 ## NLRL tasks
 
 Below provides a proper set of parameters for those tasks.

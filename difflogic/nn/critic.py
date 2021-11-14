@@ -213,8 +213,8 @@ class MixedGRUCritic(nn.Module):
         sd1 = []
         sd2 = []
         for i in range(states.shape[1]):
-            sd1.append(self.layer2Dto1D[0](states[:, i, torch.randperm(states.shape[2]), :])[0][:, -1, :])
-            sd2.append(self.layer2Dto1D[1](states[:, torch.randperm(states.shape[1]), i, :])[0][:, -1, :])
+            sd1.append(self.layer2Dto1D[0](states[:, i, :, :])[0][:, -1, :])
+            sd2.append(self.layer2Dto1D[1](states[:, :, i, :])[0][:, -1, :])
         d1.append(torch.stack(sd1, dim=1))
         d1.append(torch.stack(sd2, dim=1))
         f = torch.cat(d1, dim=2)

@@ -18,6 +18,7 @@
 import argparse
 import collections
 import copy
+import os
 
 from ..tqdm_utils import tqdm_for
 
@@ -130,6 +131,13 @@ class TrainerBase(TrainerEnv):
     init_params.update(kwargs)
 
     return cls(model, optimizer, **init_params)
+
+  @staticmethod
+  def best_meters(meters_deter, meters_stoch):
+      if meters_deter.avg['succ'] == meters_stoch.avg['succ']:
+          return meters_deter if meters_deter.avg['score'] > meters_stoch.avg['score'] else meters_stoch
+      else:
+          return meters_deter if meters_deter.avg['succ'] > meters_stoch.avg['succ'] else meters_stoch
 
   def _dump_meters(self, meters, mode):
     """Provide ways to dump the statistics (stored in meters)
@@ -385,6 +393,8 @@ class CurriculumTrainerBase(TrainerBase):
       # When all lessons finished, it becomes candidate before graduated.
       if self.current_number < self.curriculum_graduate:
         self.current_number += self.curriculum_step
+        if self.current_number > self.curriculum_graduate:
+            self.current_number = self.curriculum_graduate
         # sample_array records the lessons the model recently studied.
         self.sample_array.append(self.current_number)
       elif self.is_candidate:
@@ -394,6 +404,8 @@ class CurriculumTrainerBase(TrainerBase):
     else:
       if self.current_number < self.curriculum_graduate:
         self.current_number += self.curriculum_step
+        if self.current_number > self.curriculum_graduate:
+            self.current_number = self.curriculum_graduate
         self.sample_array.append(self.current_number)
       else:
         self.is_graduated = True
@@ -661,12 +673,15 @@ class MiningTrainerBase(CurriculumTrainerBase):
     self.model.eval()
     meters_deter = GroupMeters()
     meters_stoch = GroupMeters()
-    with tqdm_pbar(total=mining_epoch_size) as pbar:
+    disable_pbar = False
+    if os.getenv("ONCLUSTER") is not None:
+        disable_pbar = True
+    with tqdm_pbar(total=mining_epoch_size, disable=disable_pbar) as pbar:
       for i in range(mining_epoch_size):
         if i % 2 == 0:
           message, result = self._get_result(i, meters_deter, mode='mining-deter')
         else:
-          message, result = self._get_result(i, meters_stoch, mode='mining')
+          message, result = self._get_result(i, meters_stoch, mode='mining-stoch')
         positive, number, backup = self._extract_info(result)
         dataset = pos_data if positive else neg_data
         if dataset.size < mining_dataset_size:
@@ -679,13 +694,13 @@ class MiningTrainerBase(CurriculumTrainerBase):
           break
     logger.info(meters_deter.format_simple('> Mining (deter): ', compressed=False))
     logger.info(meters_stoch.format_simple('> Mining (stoch): ', compressed=False))
-    meters = meters_deter if meters_deter.avg['succ'] > meters_stoch.avg['succ'] else meters_stoch
+    meters = self.best_meters(meters_deter, meters_stoch)
     self._inherit_neg_data(neg_data, self.neg_data, meters, mining_dataset_size)
     self.pos_data = pos_data
     self.neg_data = neg_data
-    self._dump_meters(meters_deter, 'mining')
-    self._dump_meters(meters_stoch, 'mining')
-    return meters
+    self._dump_meters(meters_deter, 'mining-deter')
+    self._dump_meters(meters_stoch, 'mining-stoch')
+    return meters, meters_deter, meters_stoch
 
   def _upgrade_lesson(self):
     super()._upgrade_lesson()
@@ -706,7 +721,7 @@ class MiningTrainerBase(CurriculumTrainerBase):
       # The exam elapses longer when in candidate status.
       if self.is_candidate:
         mining_epoch_size *= self.candidate_mul
-      meters = self._mining_epoch(mining_epoch_size, self.mining_dataset_size)
+      meters, meters_deter, meters_stoch = self._mining_epoch(mining_epoch_size, self.mining_dataset_size)
 
       # Use the performance during mining as the outcome for the exam.
       if self._pass_lesson(meters):
@@ -719,6 +734,7 @@ class MiningTrainerBase(CurriculumTrainerBase):
           self._take_exam()
       else:
         self.need_mining = False
+      return [meters, meters_deter, meters_stoch]
 
   def train(self):
     self.need_mining = False

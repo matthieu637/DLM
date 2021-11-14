@@ -15,6 +15,7 @@
 # limitations under the License.
 """The utility functions for tqdm."""
 
+import os
 from jacinle.utils.tqdm import tqdm_pbar
 
 __all__ = ['tqdm_for']
@@ -23,7 +24,10 @@ __all__ = ['tqdm_for']
 def tqdm_for(total, func):
   """wrapper of the for function with message showing on the progress bar."""
   # Not support break cases for now.
-  with tqdm_pbar(total=total) as pbar:
+  disable = False
+  if os.getenv("ONCLUSTER") is not None:
+    disable = True
+  with tqdm_pbar(total=total, disable=disable) as pbar:
     for i in range(total):
       message = func(i)
       pbar.set_description(message)

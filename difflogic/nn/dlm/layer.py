@@ -213,6 +213,7 @@ class DLMLayer(nn.Module):
             for i in range(len(inputs)):
                 if inputs[i] != None:
                     useBooleanRepresentation = inputs[i].dtype == torch.bool
+                    input_device = inputs[i].device
                     break
             for i in range(self.max_order + 1):
                 if extract_rule:
@@ -251,7 +252,7 @@ class DLMLayer(nn.Module):
                         size = inputs[i].size()[:-1] + ((sizeExpand + sizeInput + sizeReduce) * np.math.factorial(i),)
                     else:
                         size = inputs[i + 1].size()[:-2] + ((sizeExpand + sizeInput + sizeReduce) * np.math.factorial(i),)
-                    f = torch.zeros(size, device=self.logic[i].weight.device, dtype=torch.bool if useBooleanRepresentation else torch.float32)
+                    f = torch.zeros(size, device=input_device, dtype=torch.bool if useBooleanRepresentation else torch.float32, requires_grad=False)
 
                     pset = set(path.cpu().numpy().flatten())
                     pset.discard(-1)
@@ -366,9 +367,7 @@ class DLMLayer(nn.Module):
                     f.append(inputs[i])
                     #findex.extend([':p'+str(j) for j in range(inputs[i].shape[-1])])
                 if i + 1 < len(inputs) and self.input_dims[i + 1] > 0:
-                    test = self.dim_reducers[i](inputs[i + 1])
                     f.append(self.dim_reducers[i](inputs[i + 1]))
-                    self.dim_reducers[i](inputs[i + 1])
                     #findex.extend(['rma:p' + str(j) for j in range(inputs[i + 1].shape[-1])])
                     #findex.extend(['rmi:p' + str(j) for j in range(inputs[i + 1].shape[-1])])
                 if len(f) == 0:
@@ -413,7 +412,6 @@ class DifferentiableLogicMachine(nn.Module):
             residual=False,
             io_residual=False,
             recursion=False,
-            connections=None,
             dlm_intern_params=None
     ):
         super().__init__()
@@ -422,16 +420,23 @@ class DifferentiableLogicMachine(nn.Module):
         self.residual = residual
         self.io_residual = io_residual
         self.recursion = recursion
-        self.connections = connections
         self.extract_path = False
         self.dlm_intern_params = dlm_intern_params
         self.allpath = []
         self.stacked_models = []
         self.is_stacked_model = False
-        self.stacked_used = []
+        self.used_predicates_graph = []
         self.input_dims = input_dims
         self.exclude_self = exclude_self
         self.number_attribute = output_dims
+        self.output_feature_axis = None
+        self.pathFromPred = None
+        self.track_duplicates = None
+        self.track_duplicates_record = []
+        self.used_inputs = []
+        self.filter_inputs = []
+        self.tail = False
+        self.store_previous_tail = False
 
         assert not (self.residual and self.io_residual), \
             'Only one type of residual connection is allowed at the same time.'
@@ -453,7 +458,6 @@ class DifferentiableLogicMachine(nn.Module):
             layer = DLMLayer(breadth, current_dims, output_dims, i,
                                exclude_self, residual, 'l'+str(i), dlm_intern_params)
             current_dims = layer.output_dims
-            current_dims = self._mask(current_dims, i, 0)
             if io_residual:
                 add_(total_output_dims, current_dims)
             self.layers.append(layer)
@@ -462,17 +466,6 @@ class DifferentiableLogicMachine(nn.Module):
             self.output_dims = total_output_dims
         else:
             self.output_dims = current_dims
-
-    # Mask out the specific group-entry in layer i, specified by self.connections.
-    # For debug usage.
-    def _mask(self, a, i, masked_value):
-        if self.connections is not None:
-            assert i < len(self.connections)
-            mask = self.connections[i]
-            if mask is not None:
-                assert len(mask) == len(a)
-                a = [x if y else masked_value for x, y in zip(a, mask)]
-        return a
 
     def update_tau(self, tau):
         for l in self.layers:
@@ -516,11 +509,22 @@ class DifferentiableLogicMachine(nn.Module):
                 if l2 is not None:
                     l2.reset_weights()
 
-    def extract_graph(self, feature_axis, pred):
-        self.feature_axis = feature_axis
+    def extract_graph(self, output_feature_axis, pred, track_duplicates=False):
+        self.output_feature_axis = output_feature_axis
         self.pathFromPred = pred.weight.argmax(-1)
+        self.pathFromPred = self.pathFromPred[self.pathFromPred != self.number_attribute].unsqueeze(0)
+        self.track_duplicates = track_duplicates
         self.eval()
         self.extract_path = True
+
+    def continuous_relaxation(self):
+        self.allpath = []
+        self.used_predicates_graph = []
+        self.used_inputs = []
+        self.train()
+        self.extract_path = False
+        self.track_duplicates = False
+        self.tail = False
 
     def fake_forward(self):
         nobj = 2
@@ -529,36 +533,126 @@ class DifferentiableLogicMachine(nn.Module):
         for i, dim in enumerate(self.input_dims):
             if dim != 0:
                 shape = [nbatch] + [nobj for _ in range(i)] + [dim]
-                f[i] = torch.zeros(shape, dtype=torch.bool)
+                f[i] = torch.zeros(shape, dtype=torch.bool, device=next(self.parameters()).device, requires_grad=False)
         self(f)
 
-    def extract_stacked(self, output_feature_axis, pred, new_param=dict()):
+    def display_distribution_extracted(self, pred, tau):
+        for i, layer in enumerate(self.used_predicates_graph):
+            print("LAYER ", i+1)
+            for j, breadth in enumerate(layer):
+                for index in breadth:
+                    print((self.layers[i].logic[j].weight/tau).softmax(-1)[index].sort(descending=True)[0][:, :4].detach().cpu().numpy())
+        print("LAST PRED")
+        print((pred.weight.softmax(-1)/tau).sort(descending=True)[0][0, :, :4].detach().cpu().numpy())
+
+    def extract_stacked(self, output_feature_axis, pred, new_param=dict(), remove_duplicates=True, onlyLastLayer=False,
+                                removeOldUnused=False, with_tail=False, with_even=False, removeOldUnusedDeg=1,
+                                store_previous_tail=False):
+
+        if store_previous_tail:
+            with_tail = True
+        self.store_previous_tail = store_previous_tail
+        if self.stacked_models:
+            self.stacked_models[-1].store_previous_tail = False
+
         self.extract_graph(output_feature_axis, pred)
+        if len(self.allpath) == 0 or len(self.used_predicates_graph) == 0:
+            with torch.set_grad_enabled(False):
+                self.fake_forward() #compute outputs shapes
+
+        if with_tail:
+            selected_preds = pred.weight.argmax(-1)[0]
+            #twice same pred
+            if (selected_preds[0] == selected_preds).all():
+                with_tail = False
+            #too much bias in the tail
+            if (selected_preds == self.number_attribute).int().sum() >= (self.dlm_intern_params['atoms_per_rule'] - 1):
+                with_tail = False
+        if with_tail:
+            self.tail = True
+
+        if remove_duplicates:
+            for (key, value) in self.track_duplicates_record.items():
+                if (value == 0).any():
+                    logger.info("duplicated detected at " + str(key) + "(depth, breadth, pred_index) with input " + str(value.argmin()))
+                    self.used_predicates_graph[key[0]][key[1]].remove(key[2])
+
+        if onlyLastLayer:
+            for i in range(self.depth - 1):
+                for j in range(self.breadth + 1):
+                    self.used_predicates_graph[i][j] = set()
+
+        if with_even:
+            for i in range(self.depth - 1):
+                if i % 2 == 1:
+                    for j in range(self.breadth + 1):
+                        self.used_predicates_graph[i][j] = set()
+
+        self.filter_inputs = []
+        if self.stacked_models and removeOldUnused:
+            self.filter_inputs = [set(range(dims)) for dims in self.input_dims]
+            #do not filter very first inputs
+            first_model = self
+            while len(first_model.stacked_models) != 0:
+                first_model = first_model.stacked_models[0]
+
+            for i in range(self.breadth + 1):
+                self.filter_inputs[i] -= [set(range(dims)) for dims in first_model.input_dims][i]
+                # nor used elements
+                self.filter_inputs[i] -= self.used_inputs[i]
+                first_model = self
+                for _ in range(removeOldUnusedDeg - 1):
+                    if len(first_model.stacked_models) == 0:
+                        break
+                    first_model = first_model.stacked_models[0]
+                    self.filter_inputs[i] -= first_model.used_inputs[i]
+                self.filter_inputs[i] = list(self.filter_inputs[i])
+
         self.is_stacked_model = True
-        self.fake_forward() #compute outputs shapes
+        self.track_duplicates = False
 
-        shapes = [sum([len(s[i]) for s in self.stacked_used]) for i in range(self.breadth + 1)]
+        shapes = [sum([len(s[i]) for s in self.used_predicates_graph]) for i in range(self.breadth + 1)]
         input_dims = (np.array(self.input_dims) + np.array(shapes)).tolist()
-
+        if with_tail:
+            input_dims[output_feature_axis] += 1
+        if self.filter_inputs:
+            input_dims = (np.array(input_dims) - np.array([len(l) for l in self.filter_inputs])).tolist()
         D = dict(depth=self.depth, breadth=self.breadth, input_dims=input_dims,
                                               output_dims=self.number_attribute, exclude_self=self.exclude_self,
                                               residual=self.residual, io_residual=self.io_residual, recursion=self.recursion,
-                                              connections=self.connections, dlm_intern_params=self.dlm_intern_params)
+                                              dlm_intern_params=self.dlm_intern_params)
         D.update(new_param)
         new_model = DifferentiableLogicMachine(**D)
         new_model.to(next(self.parameters()).device)
         new_model.stacked_models = [self]
-        pred.reset_weights()
-        return new_model
+        #save some memories
+        for l in self.layers:
+            for l2 in l.logic:
+                if l2 is not None:
+                    del l2.weight
+
+        return new_model, np.array(input_dims).sum()
 
     def forward(self, inputs, depth=None, extract_rule=False):
+        previous_stacked_tail = None
+
         for i, prev_model in enumerate(self.stacked_models):
             if i == 0:
                 f = inputs
-            f = prev_model(f, depth, extract_rule)[0]
+            out_prev = prev_model(f, depth, extract_rule)
+            f = out_prev[0]
+            if 'previous_tail' in out_prev[1].keys():
+                previous_stacked_tail = out_prev[1]['previous_tail']
+
         if self.stacked_models:
             for j in range(self.breadth + 1):
-                inputs[j] = merge(inputs[j], f[j])
+                if self.stacked_models[0].filter_inputs and len(self.stacked_models[0].filter_inputs[j]) > 0:
+                    index = torch.ones(inputs[j].shape[-1], dtype=bool, device=inputs[j].device, requires_grad=False)
+                    index[self.stacked_models[0].filter_inputs[j]] = False
+                    inputs[j] = merge(inputs[j][..., index], f[j])
+                else:
+                    inputs[j] = merge(inputs[j], f[j])
+
 
         # depth: the actual depth used for inference
         if depth is None:
@@ -614,7 +708,7 @@ class DifferentiableLogicMachine(nn.Module):
                         enable_feature_axis=True
                     else:
                         enable_feature_axis=False
-                    inputsSize, isResidual, isExpanded, isInput, isReduced, sizeResidual, sizeExpand, sizeInput, sizeReduce, paths = layer.fakeForward(inputsSize, enable_feature_axis, self.feature_axis)
+                    inputsSize, isResidual, isExpanded, isInput, isReduced, sizeResidual, sizeExpand, sizeInput, sizeReduce, paths = layer.fakeForward(inputsSize, enable_feature_axis, self.output_feature_axis)
 
                 if i == depth:
                     paths = self.pathFromPred
@@ -629,7 +723,7 @@ class DifferentiableLogicMachine(nn.Module):
                 allPaths.append(paths)
 
             # now go backward
-            for i in range(len(layers), 0, -1):
+            for i in range(len(layers), -1, -1):
                 residualusefulp = [set() for j in range(self.breadth + 1)]
                 expandusefulp = [set() for j in range(self.breadth + 1)]
                 inputusefulp = [set() for j in range(self.breadth + 1)]
@@ -647,7 +741,7 @@ class DifferentiableLogicMachine(nn.Module):
                         # means from ffand or ffor, f[m,[0,1],...] is useless
                         # means in the previous layer, weight[m,:] is useless
                         # back propagation: current layer set p --> modify previous
-                        if (i == len(layers)-1 and j != self.feature_axis) or allPaths[i][j] is None:
+                        if (i == len(layers)-1 and j != self.output_feature_axis) or allPaths[i][j] is None:
                             continue
                         else:
                             pathset=set(allPaths[i][j].cpu().numpy().flatten())
@@ -672,35 +766,38 @@ class DifferentiableLogicMachine(nn.Module):
                                 else:
                                     assert isReduces[i][j]
                                     reduceusefulp[j].add((p - (sizesExpand[i][j] + sizesInput[i][j])) // 2)
-                    for j in range(self.breadth + 1):
-                        if i==len(layers)-1 and j != self.feature_axis:
-                            for m in range(allPaths[i][j].size(0)):
-                                allPaths[i][j][m, :] = -1
 
-                        if j == 0:
-                            if allPaths[i - 1][j] is not None:
-                                for m in range(allPaths[i - 1][j].size(0)):
-                                    if (m not in inputusefulp[j]) and (m not in expandusefulp[j + 1]) and (m not in residualusefulp[j]):
-                                        allPaths[i - 1][j][m, :] = -1
-                        elif j > 0 and j < self.breadth:
-                            if allPaths[i - 1][j] is not None:
-                                for m in range(allPaths[i - 1][j].size(0)):
-                                    if (m not in expandusefulp[j + 1]) and (m not in inputusefulp[j]) and (m not in reduceusefulp[j - 1]) and (m not in residualusefulp[j]):
-                                        allPaths[i - 1][j][m, :] = -1
-                        else:
-                            if allPaths[i - 1][j] is not None:
-                                for m in range(allPaths[i - 1][j].size(0)):
-                                    if (m not in inputusefulp[j]) and (m not in reduceusefulp[j - 1]) and (m not in residualusefulp[j]):
-                                        allPaths[i - 1][j][m, :] = -1
+                    if i > 0:
+                        for j in range(self.breadth + 1):
+                            if i==len(layers)-1 and j != self.output_feature_axis:
+                                for m in range(allPaths[i][j].size(0)):
+                                    allPaths[i][j][m, :] = -1
+
+                            if j == 0:
+                                if allPaths[i - 1][j] is not None:
+                                    for m in range(allPaths[i - 1][j].size(0)):
+                                        if (m not in inputusefulp[j]) and (m not in expandusefulp[j + 1]) and (m not in residualusefulp[j]):
+                                            allPaths[i - 1][j][m, :] = -1
+                            elif j > 0 and j < self.breadth:
+                                if allPaths[i - 1][j] is not None:
+                                    for m in range(allPaths[i - 1][j].size(0)):
+                                        if (m not in expandusefulp[j + 1]) and (m not in inputusefulp[j]) and (m not in reduceusefulp[j - 1]) and (m not in residualusefulp[j]):
+                                            allPaths[i - 1][j][m, :] = -1
+                            else:
+                                if allPaths[i - 1][j] is not None:
+                                    for m in range(allPaths[i - 1][j].size(0)):
+                                        if (m not in inputusefulp[j]) and (m not in reduceusefulp[j - 1]) and (m not in residualusefulp[j]):
+                                            allPaths[i - 1][j][m, :] = -1
                 else:
                     pathset = set(allPaths[i].cpu().numpy().flatten())
                     for j in range(self.breadth + 1):
                         for m in range(allPaths[i - 1][j].size(0)):
                             if m not in pathset:
                                 allPaths[i - 1][j][m, :] = -1
-                    j = self.feature_axis
+                    j = self.output_feature_axis
                     for p in pathset:
-                        inputusefulp[self.feature_axis].add(p)
+                        if p != self.number_attribute: #remove bias
+                            inputusefulp[self.output_feature_axis].add(p)
 
                 usedPrevious = copy.deepcopy(inputusefulp)
                 for ind in range(self.breadth + 1):
@@ -708,12 +805,21 @@ class DifferentiableLogicMachine(nn.Module):
                         usedPrevious[ind] = usedPrevious[ind].union(expandusefulp[ind + 1])
                     if ind >= 0:
                         usedPrevious[ind] = usedPrevious[ind].union(reduceusefulp[ind - 1])
-                self.stacked_used.append(usedPrevious)
+                if i != 0:
+                    self.used_predicates_graph.append(usedPrevious)
+                else:
+                    self.used_inputs = usedPrevious
 
-            self.allpath=allPaths
-            self.stacked_used = list(reversed(self.stacked_used))
+            self.allpath = allPaths
+            self.used_predicates_graph = list(reversed(self.used_predicates_graph))
+            self.track_duplicates_record = dict()
+            for d, layer in enumerate(self.used_predicates_graph):
+                for breadth, module in enumerate(layer):
+                    for index_module in module:
+                        if inputs[breadth] is not None:
+                            self.track_duplicates_record[(d, breadth, index_module)] = torch.zeros(inputs[breadth].shape[-1], dtype=torch.int, requires_grad=False)
         elif self.extract_path and len(self.allpath) > 0:
-            allPaths=self.allpath
+            allPaths = self.allpath
         outputs = [None for _ in range(self.breadth + 1)]
         f = inputs
 
@@ -739,17 +845,37 @@ class DifferentiableLogicMachine(nn.Module):
             f, other_output = layer(f, allPaths[i], extract_rule)
             update_dict_list(other_outputs, other_output)
 
-            #f = self._mask(f, i, None)  # for debuge useage, do nothing here
             if self.io_residual:
                 for j, out in enumerate(f):
                     outputs[j] = merge(outputs[j], out)
             if self.is_stacked_model:
                 for j, out in enumerate(f):
-                    if out is not None and len(self.stacked_used[i][j]) > 0:
-                        used_index = list(self.stacked_used[i][j])
+                    if out is not None and len(self.used_predicates_graph[i][j]) > 0:
+                        used_index = list(self.used_predicates_graph[i][j])
                         outputs[j] = merge(outputs[j], out[..., used_index])
+                j = self.output_feature_axis
+                if self.tail and f[j] is not None and i == depth - 1:
+                    previous_tail = f[j][..., self.pathFromPred[0]].prod(-1).detach().unsqueeze(-1)
+                    outputs[j] = merge(outputs[j], previous_tail)
+                    if self.store_previous_tail:
+                        previous_stacked_tail = previous_tail
+                elif self.store_previous_tail:
+                    previous_stacked_tail = f[j][..., self.pathFromPred[0]].prod(-1).detach().unsqueeze(-1)
+
+            if self.track_duplicates:
+                for j, out in enumerate(f):
+                    if inputs[j] is not None:
+                        if out is not None and len(self.used_predicates_graph[i][j]) > 0:
+                            for module_index in list(self.used_predicates_graph[i][j]):
+                                base = (inputs[j] == out[..., module_index].unsqueeze(-1))
+                                while len(base.shape) > 2:
+                                    base = base.all(1)
+                                self.track_duplicates_record[(i, j, module_index)] += (base == False).int().sum(0).cpu()
         if not self.io_residual and not self.is_stacked_model:
             outputs = f
+
+        if previous_stacked_tail is not None:
+            other_outputs['previous_tail'] = previous_stacked_tail
         return outputs, other_outputs
 
     __hyperparams__ = (

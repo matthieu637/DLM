@@ -150,7 +150,7 @@ data_gen_group.add_argument(
 
 MiningTrainerBase.make_trainer_parser(
     parser, {
-        'epochs': 500,
+        'epochs': 1000,
         'epoch_size': 100,
         'test_epoch_size': 50,
         'test_number_begin': 10,
@@ -221,6 +221,30 @@ train_group.add_argument(
     '--extract-path', action='store_true', help='extract path or not')
 train_group.add_argument(
     '--extract-rule', action='store_true', help='extract rule')
+train_group.add_argument(
+    '--incr-llonly',
+    type='bool',
+    default=False)
+train_group.add_argument(
+    '--incr-rmunused',
+    type='bool',
+    default=False)
+train_group.add_argument(
+    '--incr-rmunused-deg',
+    type=int,
+    default=1)
+train_group.add_argument(
+    '--incr-with-tail',
+    type='bool',
+    default=True)
+train_group.add_argument(
+    '--incr-with-even',
+    type='bool',
+    default=False)
+train_group.add_argument(
+    '--incr-with-distill',
+    type='bool',
+    default=False)
 train_group.add_argument(
     '--gumbel-noise-begin',
     type=float,
@@ -340,7 +364,7 @@ schedule_group.add_argument(
 schedule_group.add_argument(
     '--early-drop-epochs',
     type=int,
-    default=50,
+    default=2000,
     metavar='N',
     help='epochs could spend for each lesson, early drop')
 schedule_group.add_argument(
@@ -397,7 +421,8 @@ if 'nlrl' in args.task:
 elif args.task in ['sort', 'path']:
     args.concat_worlds = False
     args.pred_weight = 0.0
-#    args.curriculum_start = 3
+    if args.curriculum_start < 3:
+        args.curriculum_start = 3
 
 if args.task == 'sort':
     from difflogic.envs.algorithmic import make as make_env
@@ -497,6 +522,10 @@ class Model(nn.Module):
         self.loss = PPOLoss()
         self.pred_loss = nn.BCELoss()
         self.force_decay = False
+        self.left_distill_epoch = -2
+        self.distill = False
+        self.working_policy = None
+        self.train_succ_avg = None
 
         range_dims=[]
         for i in range(args.curriculum_start, args.curriculum_graduate + args.curriculum_step, args.curriculum_step):
@@ -590,20 +619,48 @@ class Model(nn.Module):
                 self.features.with_dropout(True)
 
     def stoch_decay(self, lesson, train_succ):
-        if (args.model == 'dlm' and not args.no_decay and lesson == args.curriculum_graduate and train_succ > 0.95) or self.force_decay:
+        reload_optimizer = False
+
+        if (args.model == 'dlm' and not args.no_decay and train_succ > 0.95 and not self.distill) or self.force_decay:
+            if not self.force_decay:
+                self.train_succ_avg = collections.deque(maxlen=10)
+                if args.incr_with_distill:
+                    logger.info("Save policy")
+                    self.working_policy = copy.deepcopy(self)
+                    self.working_policy.features.continuous_relaxation()
+                    self.working_policy.distill = False
+                    self.working_policy.lowernoise()
+            if self.train_succ_avg:
+                self.train_succ_avg.append(train_succ)
             self.force_decay = True
-            self.tau = self.tau * 0.995
+            self.tau = self.tau * 0.98
             self.gumbel_prob = self.gumbel_prob * 0.98
             self.dropout_prob = self.dropout_prob * 0.98
             args.pred_weight = args.pred_weight * 0.98
 
             #considered it failed
-            if self.tau <= 0.45:
+            if self.tau <= 0.005 or \
+                    (self.train_succ_avg and len(self.train_succ_avg) >= self.train_succ_avg.maxlen and
+                     (sum(self.train_succ_avg) / len(self.train_succ_avg)) < 0.85):
+                logger.info("Failed to extract interpretable policy ")
+                if self.tau <= 0.005:
+                    logger.info("because tau is too low")
+                else:
+                    logger.info("because succ rate too impacted")
                 self.tau = args.tau_begin
                 self.dropout_prob = args.dropout_prob_begin
                 self.gumbel_prob = args.gumbel_noise_begin
+                self.features.reset_weights()
+                self.pred.reset_weights()
+                reload_optimizer = True
+                if args.incr_with_distill:
+                    self.left_distill_epoch = 30
+                # else:
+                #     self.force_decay = False
 
             self.update_stoch()
+
+        return reload_optimizer
 
     def forward(self, feed_dict):
         feed_dict = GView(feed_dict)
@@ -657,8 +714,42 @@ class Model(nn.Module):
             crit_out = None
 
         if not feed_dict.training:
+            if self.distill and self.working_policy is None and 'previous_tail' in more_info.keys():
+                logits_previous_tail = more_info['previous_tail'].squeeze(dim=-1).view(batch_size, -1)
+                if args.distribution == 0:
+                    sigma = logits_previous_tail.sum(-1).unsqueeze(-1)
+                    policy_previous_tail = torch.where(sigma > 1.0, logits_previous_tail / sigma, logits_previous_tail + (1 - sigma) / logits_previous_tail.shape[1])
+                elif args.distribution == 1:
+                    policy_previous_tail = F.softmax(logits_previous_tail / args.last_tau, dim=-1).clamp(min=1e-20)
+                elif args.distribution == 2:
+                    if self.training:
+                        fa = self.ac_selector(saved_for_fa.detach())
+                        policy_previous_tail = (fa.sigmoid() + 1e-5) * logits_previous_tail
+                    else:
+                        policy_previous_tail = logits_previous_tail
+                    policy_previous_tail = policy_previous_tail / policy_previous_tail.sum(-1).unsqueeze(-1)
+                else:
+                    raise()
+                return dict(policy=policy_previous_tail, logits=logits_previous_tail, value=crit_out)
+            elif self.distill:
+                feed_dict_out = self.working_policy(feed_dict)
+                return dict(policy=feed_dict_out['policy'], logits=feed_dict_out['logits'], value=feed_dict_out['value'])
             return dict(policy=policy, logits=logits, value=crit_out)
-        loss, monitors = self.loss(policy, feed_dict.old_policy, feed_dict.actions, feed_dict.advantages, args.epsilon, feed_dict.entropy_beta)
+
+        if self.distill and self.working_policy is None:
+            loss = self.pred_loss(policy, more_info['previous_tail'].squeeze(dim=-1).view(batch_size, -1))
+            monitors = dict()
+            monitors['distill_loss'] = loss
+        elif self.distill:
+            with torch.set_grad_enabled(False):
+                f_teacher, _, _ = self.working_policy.get_binary_relations(states)
+                f_teacher = self.working_policy.pred(f_teacher)[0].squeeze(dim=-1).view(batch_size, -1)
+            loss = self.pred_loss(logits, f_teacher)
+            monitors = dict()
+            monitors['distill_loss'] = loss
+        else:
+            loss, monitors = self.loss(policy, feed_dict.old_policy, feed_dict.actions, feed_dict.advantages, args.epsilon, feed_dict.entropy_beta)
+
         if self.isQnet:
             crit_preloss = (crit_out * feed_dict.actions_ohe).sum(-1)
         else:
@@ -847,11 +938,13 @@ def run_episode(env,
     if args.model == 'dlm':
         # by default network isn't in training mode during data collection
         # but with dlm we don't want to use argmax only
-        # except in 2 cases (testing the interpretability or the last mining phase to get an interpretable policy):
-        if ('inter' in mode) or (('mining' in mode) or ('inherit' in mode) and number == args.curriculum_graduate):
+        # except in 2 cases (testing the interpretability or the mining phase to get an interpretable policy):
+        if ('inter' in mode) or ('mining' in mode) or ('inherit' in mode):
             model.lowernoise()
+            model.features.extract_graph(model.feature_axis, model.pred, track_duplicates=('mining' in mode))
         else:
             model.train(True)
+            model.features.continuous_relaxation()
 
             if args.dlm_noise == 1 and (('mining' in mode) or ('inherit' in mode) or ('test' in mode)):
                 model.lowernoise()
@@ -974,11 +1067,27 @@ def run_episode(env,
 
 
 class MyTrainer(MiningTrainerBase):
+
+    def __init__(self, model, optimizer, epochs, epoch_size, test_epoch_size, test_number_begin, test_number_step,
+                 test_number_end, curriculum_start, curriculum_step, curriculum_graduate, enable_candidate, curriculum_thresh,
+                 curriculum_thresh_relax, curriculum_force_upgrade_epochs, sample_array_capacity, enhance_epochs, enable_mining,
+                 repeat_mining, candidate_mul, mining_interval, mining_epoch_size, mining_dataset_size, inherit_neg_data,
+                 disable_balanced_sample, prob_pos_data):
+        super().__init__(model, optimizer, epochs, epoch_size, test_epoch_size, test_number_begin, test_number_step, test_number_end,
+                         curriculum_start, curriculum_step, curriculum_graduate, enable_candidate, curriculum_thresh,
+                         curriculum_thresh_relax, curriculum_force_upgrade_epochs, sample_array_capacity, enhance_epochs, enable_mining,
+                         repeat_mining, candidate_mul, mining_interval, mining_epoch_size, mining_dataset_size, inherit_neg_data,
+                         disable_balanced_sample, prob_pos_data)
+        self.should_extract = False
+
     def save_checkpoint(self, name):
         if args.checkpoints_dir is not None:
-            checkpoint_file = os.path.join(args.checkpoints_dir,
-                                           'checkpoint_{}.pth'.format(name))
-            super().save_checkpoint(checkpoint_file)
+            checkpoint_file = os.path.join(args.checkpoints_dir, 'checkpoint_{}.pth'.format(name))
+            super().save_checkpoint(checkpoint_file, extra=self.model)
+
+    def load_checkpoint(self, filename):
+        del self._model
+        self._model = torch.load(filename)['extra']
 
     def _dump_meters(self, meters, mode):
         if args.summary_file is not None:
@@ -1096,8 +1205,43 @@ class MyTrainer(MiningTrainerBase):
         self.entropy_beta *= args.entropy_beta_decay
         self.set_learning_rate(self.lr)
 
+        if not (self.is_candidate or self.is_graduated):
+            self.model.force_decay = True
+            self.model.working_policy = None
+            self.should_extract = True
+
     def _train_epoch(self, epoch_size):
+        if self.should_extract:
+            logger.info("TRIGGERED extraction for new lesson " + str(sum(p.numel() for p in self.model.features.parameters())) +
+                        " parameters with " + str(np.array(self.model.features.input_dims).sum()) + " predicates")
+            self.model.tau = args.tau_begin
+            self.model.dropout_prob = args.dropout_prob_begin
+            self.model.gumbel_prob = args.gumbel_noise_begin
+            self.model.update_stoch()
+
+            new_features, entries_size = self.model.features.extract_stacked(self.model.feature_axis, self.model.pred, onlyLastLayer=args.incr_llonly,
+                                                                             removeOldUnused=args.incr_rmunused, with_tail=args.incr_with_tail,
+                                                                             with_even=args.incr_with_even, removeOldUnusedDeg=args.incr_rmunused_deg,
+                                                                             store_previous_tail=args.incr_with_distill)
+            new_pred = DLMInferenceBase(new_features.output_dims[self.model.feature_axis], 1, False, 'root')
+            new_pred.to(next(self.model.parameters()).device)
+            self.model.pred = new_pred
+            self.model.features = new_features
+            self._optimizer = get_optimizer(args.optimizer, self.model, args.lr)
+            logger.info("TRIGGERED AFTER " + str(sum(p.numel() for p in self.model.features.parameters())) +
+                        " parameters with " + str(entries_size) + " predicates")
+            if args.incr_with_distill:
+                self.model.left_distill_epoch = 30
+                self.model.force_decay = True
+
+            self.should_extract = False
+
         model = self.model
+        model.distill = (model.left_distill_epoch >= 0)
+        if model.left_distill_epoch == -1:
+            model.force_decay = False
+            model.train_succ_avg = None
+        model.left_distill_epoch -= 1
         meters = GroupMeters()
         self._prepare_dataset(epoch_size, mode='train')
 
@@ -1133,10 +1277,12 @@ class MyTrainer(MiningTrainerBase):
                 '> Train Epoch {:5d}: '.format(self.current_epoch),
                 compressed=False))
         self._dump_meters(meters, 'train')
-        if not self.is_graduated:
-            self._take_exam(train_meters=copy.copy(meters))
 
-        self.model.stoch_decay(self.current_number, meters.avg['succ'])
+        reload_optimizer = self.model.stoch_decay(self.current_number, meters.avg['succ'])
+        if reload_optimizer:
+            self._optimizer = get_optimizer(args.optimizer, self.model, self.lr)
+        elif not self.is_graduated and not self.model.distill:
+            self._take_exam(train_meters=copy.copy(meters))
 
         i = self.current_epoch
         if args.save_interval is not None and i % args.save_interval == 0:

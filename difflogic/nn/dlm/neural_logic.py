@@ -3,17 +3,12 @@ import warnings
 
 import torch
 import torch.nn as nn
-from torch._overrides import has_torch_function, handle_torch_function
 from torch.nn.parameter import Parameter
 
 __all__ = ['LogicInference', 'DLMInferenceBase']
 
 
 def my_gumbel_softmax(logits, tau=1, hard=False, activate_gumbel=False, gumbel_sigma=1, dim=-1):
-    if not torch.jit.is_scripting():
-        if type(logits) is not torch.Tensor and has_torch_function((logits,)):
-            return handle_torch_function(
-                my_gumbel_softmax, (logits,), logits, tau=tau, activate_gumbel=activate_gumbel, hard=hard, gumbel_sigma=gumbel_sigma, dim=dim)
 
     if hard or not activate_gumbel:
         gumbels = torch.zeros(logits.shape, device=logits.device)
@@ -21,6 +16,9 @@ def my_gumbel_softmax(logits, tau=1, hard=False, activate_gumbel=False, gumbel_s
         gumbels = gumbel_sigma * -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
 
     gumbels = (logits + gumbels) / tau  # ~Gumbel(logits,tau)
+    #large numbers stability
+    M = gumbels.detach().max(dim)[0]
+    gumbels = gumbels - M.unsqueeze_(-1)
     y_soft = gumbels.softmax(dim)
 
     if hard:
